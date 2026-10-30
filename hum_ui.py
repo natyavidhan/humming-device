@@ -1,23 +1,20 @@
 import ctypes
 import math
-import time
+import queue
+import sys, os
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
-import random
-from dataclasses import dataclass
-
-import librosa
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app import audio_recorder, audio_preprocessor, pitch_detector, melody_extractor, midi_generator, instrument_renderer, audio_player
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from app import audio_preprocessor, pitch_detector, melody_extractor, midi_generator, instrument_renderer, guitar, drums
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -25,12 +22,14 @@ except Exception:
     pass
 
 HERE = Path(__file__).parent
-SAVE_DIR = Path.home() / "Desktop"
+SAVE_DIR = Path.home() / "Desktop" if (Path.home() / "Desktop").is_dir() else Path.home() / "Hum"
 ORANGE, DARK, BLACK, WHITE, GREY = "#CE5719", "#A8470F", "#000000", "#FFFFFF", "#3A3A3A"
 W, H = 380, 470
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 ANCHOR = {"nw": "la", "ne": "ra", "center": "mm", "w": "lm", "e": "rm"}
 RECORD_SECONDS = 8
+SR = 22050
+INSTRUMENTS = ("Piano", "Guitar", "Drums")
 
 @lru_cache(maxsize=None)
 def load_font(px):
@@ -41,26 +40,38 @@ def load_font(px):
             continue
     return ImageFont.load_default()
 
-def to_midi(hz):
-    return 69 + 12 * math.log2(hz / 440.0)
-
 def midi_name(m):
     m = int(round(m))
     return f"{NOTE_NAMES[m % 12]}{m // 12 - 1}"
 
-def note_stats(notes):
+def note_stats(melody):
+    notes = melody["notes"] if melody else []
     if not notes:
         return {"Median": "-", "Spread": "-", "Notes": "0", "Tuning": "-"}
-    m = np.array([to_midi(n.pitch_hz) for n in notes])
-    cents = (m - np.round(m)) * 100
-    return {"Median": midi_name(np.median(m)), "Spread": f"{m.max() - m.min():.0f} st",
-            "Notes": str(len(notes)), "Tuning": f"{cents.mean():+.0f} c"}
+    m = np.array([n["midi_note"] for n in notes])
+    return {"Median": midi_name(np.median(m)), "Spread": f"{m.max() - m.min()} st",
+            "Notes": str(len(notes)), "Tuning": f"{melody['tuning_cents']:+.0f} c"}
 
-@dataclass
-class Note:
-    start: float
-    end: float
-    pitch_hz: float
+def guitar_stats(arr):
+    if arr is None or not arr.notes:
+        return {"Key": "-", "Chords": "-", "Frets": "-", "Notes": "0"}
+    tonic, mode = arr.key.split()
+    frets = [f for _, f in arr.frets]
+    return {"Key": f"{tonic} {mode[:3]}", "Chords": str(len({c.name for c in arr.chords})),
+            "Frets": f"{min(frets)}-{max(frets)}", "Notes": str(len(arr.notes))}
+
+def drum_stats(hits):
+    if not hits:
+        return {"Tempo": "-", "Hits": "0", "Kicks": "0", "Snares": "0"}
+    count = lambda d: str(sum(h["drum"] == d for h in hits))
+    return {"Tempo": f"{60 / drums.beat_length(hits):.0f} bpm", "Hits": str(len(hits)),
+            "Kicks": count(drums.KICK), "Snares": count(drums.SNARE)}
+
+def mic_name():
+    try:
+        return sd.query_devices(kind="input")["name"]
+    except Exception:
+        return "No microphone found"
 
 class App:
     def __init__(self):
@@ -71,25 +82,36 @@ class App:
         self.root.geometry(f"{int(W * self.S)}x{int(H * self.S)}+60+60")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.cv = tk.Canvas(self.root, width=int(W * self.S), height=int(H * self.S), bg=BLACK, highlightthickness=0)
         self.cv.pack()
         self.item = self.cv.create_image(0, 0, anchor="nw")
         self.cv.bind("<Button-1>", self.on_click)
-        self.mic = "Microphone"
-        self.state, self.mode, self.msg, self.error = "idle", "piano", "", ""
-        self.chunks, self.levels, self.stream, self.t0 = [], [], None, 0.0
-        self.result, self.notes, self.duration = None, [], 0.0
+        self.mic = mic_name()
+        # work done on background threads hands its results back through here; Tk is main-thread only
+        self.ui_calls = queue.Queue()
+        self.state, self.msg, self.error = "idle", "", ""
+        self.chunks, self.levels, self.peak, self.stream, self.t0 = [], [], 0.0, None, 0.0
+        self.melody, self.arr, self.duration = None, None, 0.0
+        self.instrument, self.backing = "Piano", True
+        self.previews, self.rendering = {}, False
         self.playing, self.play_t0, self.play_len, self.saved = False, 0.0, 0.0, None
         self.hit = []
-        self.audio = None
-        self.sr = 22050
-        self.melody = None
-        self.instrument = "Piano"
+        self.drawn_minute = None
         self.draw()
         self.tick()
 
     def run(self):
         self.root.mainloop()
+
+    def close(self):
+        self.stop_play()
+        if self.stream is not None:
+            self.stream.close()
+        self.root.destroy()
+
+    def post(self, fn):
+        self.ui_calls.put(fn)
 
     def rr(self, x1, y1, x2, y2, r=8, fill=None, outline=None, width=1):
         K = self.K
@@ -124,9 +146,10 @@ class App:
         self.d = ImageDraw.Draw(self.img)
         self.hit = []
         now = datetime.now()
+        self.drawn_minute = now.minute
         self.text(40, 40, f"{now:%A} {now.day}", 8)
         self.text(38, 58, f"{now:%H:%M}", 26)
-        {"idle": self.screen_record, "recording": self.screen_record,
+        {"idle": self.screen_record, "recording": self.screen_record, "analyzing": self.screen_record,
          "output": self.screen_output, "save": self.screen_save}[self.state]()
         out = self.img.resize((int(W * self.S), int(H * self.S)), Image.LANCZOS)
         self.photo = ImageTk.PhotoImage(out)
@@ -134,29 +157,36 @@ class App:
 
     def screen_record(self):
         rec = self.state == "recording"
-        self.text(38, 212, "Recording" if rec else "Start recording", 8)
+        title = {"idle": "Start recording", "recording": "Recording  -  tap to stop", "analyzing": "Listening back..."}
+        self.text(38, 212, title[self.state], 8)
         self.rr(28, 240, 352, 310, fill=ORANGE)
         self.dots(272)
-        if rec:
-            for i, lv in enumerate(self.levels[-50:]):
-                h = min(1.0, lv * 6) * 26
-                self.rect(40 + i * 6, 273.5 - h, 43 + i * 6, 273.5 + h, BLACK)
-        secs = time.time() - self.t0 if rec else 0.0
-        remaining = max(0, RECORD_SECONDS - secs) if rec else RECORD_SECONDS
+        for i, lv in enumerate(self.levels[-50:]):
+            h = min(1.0, lv * 8) * 26
+            self.rect(40 + i * 6, 273.5 - h, 43 + i * 6, 273.5 + h, BLACK)
+        remaining = max(0.0, RECORD_SECONDS - (time.time() - self.t0)) if rec else RECORD_SECONDS
         self.text(350, 318, f"{remaining:.1f}", 8, anchor="ne")
         if self.error:
             self.text(38, 350, self.error[:46], 6, ORANGE)
         else:
             self.text(38, 350, f"Mic: {self.mic[:40]}", 6, "#8A8A8A")
-        self.hit.append(("panel", 28, 240, 352, 310))
+        if self.state != "analyzing":
+            self.hit.append(("panel", 28, 240, 352, 310))
 
     def screen_output(self):
-        self.text(38, 112, self.msg, 8)
+        msg = self.error or ("Rendering..." if self.rendering else self.msg)
+        self.text(38, 112, msg[:16], 8, ORANGE if self.error else WHITE)
+        for i, name in enumerate(INSTRUMENTS):
+            x1 = 166 + i * 64
+            self.button(f"inst_{name}", x1, 102, x1 + 58, 124, name, self.instrument == name, 6)
         self.draw_roll(28, 134, 352, 288)
         self.button("play", 28, 298, 108, 330, "Stop" if self.playing else "Play", True, 8)
-        # only piano
-        self.instrument = "Piano"
-        for i, (k, v) in enumerate(note_stats(self.notes).items()):
+        if self.instrument != "Piano":
+            what = "Chords" if self.instrument == "Guitar" else "Hi-hat"
+            self.button("backing", 116, 298, 236, 330, f"{what} {'on' if self.backing else 'off'}", self.backing, 7)
+        stats = {"Piano": lambda: note_stats(self.melody), "Guitar": lambda: guitar_stats(self.arr),
+                 "Drums": lambda: drum_stats(self.view_notes())}[self.instrument]()
+        for i, (k, v) in enumerate(stats.items()):
             x1, y1 = 28 + (i % 2) * 168, 342 + (i // 2) * 38
             self.rr(x1, y1, x1 + 156, y1 + 30, fill=BLACK, outline=GREY)
             self.text(x1 + 10, y1 + 15, k.upper(), 6, WHITE, "w")
@@ -166,46 +196,97 @@ class App:
     def screen_save(self):
         self.text(38, 212, "Saved" if self.saved else "Save", 8)
         self.rr(28, 240, 352, 310, fill=ORANGE)
-        if self.saved:
-            self.text(46, 258, "Saved to Desktop", 10, BLACK)
-            self.text(46, 284, self.saved.name, 7, BLACK)
+        if self.error:
+            self.text(46, 258, "Could not save", 10, BLACK)
+            self.text(46, 284, self.error[:40], 6, BLACK)
+        elif self.saved:
+            self.text(46, 258, f"Saved to {SAVE_DIR.name}", 10, BLACK)
+            self.text(46, 284, self.saved, 6, BLACK)
         else:
             self.text(46, 258, "Generating...", 10, BLACK)
         self.button("new", 28, 326, 352, 372, "Start new", False, 9)
         if self.saved:
-            self.text(38, 392, f"Folder: {SAVE_DIR}", 6)
+            folder = str(SAVE_DIR)
+            self.text(38, 392, f"Folder: {folder if len(folder) <= 44 else '...' + folder[-41:]}", 6)
+
+    def view_notes(self):
+        if self.instrument == "Drums":
+            return self.melody.get("drum_hits", []) if self.melody else []
+        if self.instrument == "Guitar" and self.arr is not None:
+            return self.arr.notes
+        return self.melody["notes"] if self.melody else []
 
     def draw_roll(self, x1, y1, x2, y2):
         self.rr(x1, y1, x2, y2, fill=ORANGE)
-        ms = [to_midi(n.pitch_hz) for n in self.notes]
-        lo, hi = (math.floor(min(ms)) - 1, math.ceil(max(ms)) + 1) if ms else (57, 69)
+        if self.instrument == "Drums":
+            return self.draw_drum_lanes(x1, y1, x2, y2)
+        guitar_mode = self.instrument == "Guitar" and self.arr is not None
+        notes = self.view_notes()
+        ms = [n["midi_note"] for n in notes]
+        lo, hi = (min(ms) - 1, max(ms) + 1) if ms else (57, 69)
         if hi - lo < 12:
             mid = (lo + hi) / 2
             lo, hi = mid - 6, mid + 6
         left, right = x1 + 44, x2 - 10
-        top, bottom = y1 + 10, y2 - 10
+        top, bottom = y1 + (26 if guitar_mode else 10), y2 - 10
         ypos = lambda m: bottom - (m - lo) / (hi - lo) * (bottom - top)
+        dur = max(self.duration, 0.5)
+        xpos = lambda t: left + min(t / dur, 1.0) * (right - left)
         for m in range(math.ceil(lo), math.floor(hi) + 1):
             if m % 12 in (0, 7):
                 self.line(left, ypos(m), right, ypos(m), DARK)
                 self.text(x1 + 8, ypos(m), midi_name(m), 6, BLACK, "w")
-        dur = max(self.duration, 0.5)
-        for n, m in zip(self.notes, ms):
-            bx1 = left + n.start / dur * (right - left)
-            bx2 = max(bx1 + 5, left + n.end / dur * (right - left))
+        if guitar_mode and self.backing:
+            for ch in self.arr.chords:
+                self.line(xpos(ch.start), y1 + 8, xpos(ch.start), bottom, DARK)
+                self.text(xpos(ch.start) + 3, y1 + 13, ch.name, 6, BLACK, "w")
+        for i, (n, m) in enumerate(zip(notes, ms)):
+            bx1 = xpos(n["start"])
+            bx2 = max(bx1 + 5, xpos(n["start"] + n["duration"]))
             self.rr(bx1, ypos(m) - 4, bx2, ypos(m) + 4, r=4, fill=BLACK)
+            if guitar_mode:  # fret number, string shown by the tab file
+                self.text(bx1, ypos(m) - 10, str(self.arr.frets[i][1]), 5, BLACK, "w")
         if self.playing:
-            px = left + min((time.time() - self.play_t0) / dur, 1.0) * (right - left)
+            px = xpos(time.time() - self.play_t0)
+            self.line(px, top, px, bottom, BLACK, 2)
+
+    def draw_drum_lanes(self, x1, y1, x2, y2):
+        left, right = x1 + 44, x2 - 10
+        top, bottom = y1 + 10, y2 - 10
+        lane_h = (bottom - top) / len(drums.LANES)
+        dur = max(self.duration, 0.5)
+        xpos = lambda t: left + min(t / dur, 1.0) * (right - left)
+        hits = self.view_notes() + (drums.hat_groove(self.view_notes()) if self.backing else [])
+        for i, d in enumerate(drums.LANES):
+            y = top + (i + 0.5) * lane_h
+            self.line(left, y, right, y, DARK)
+            self.text(x1 + 8, y, drums.NAMES[d], 6, BLACK, "w")
+            for h in hits:
+                if h["drum"] == d:
+                    r = 2 + 3 * h["velocity"] / 127
+                    self.rr(xpos(h["time"]) - r, y - r, xpos(h["time"]) + r, y + r, r=r, fill=BLACK)
+        if self.playing:
+            px = xpos(time.time() - self.play_t0)
             self.line(px, top, px, bottom, BLACK, 2)
 
     def tick(self):
+        dirty = False
+        while not self.ui_calls.empty():
+            self.ui_calls.get_nowait()()
+            dirty = True
         if self.state == "recording":
-            self.levels.append(random.random() * 0.12)
+            self.levels.append(self.peak)
+            self.peak = 0.0
             if time.time() - self.t0 >= RECORD_SECONDS:
                 self.stop_recording()
-        if self.playing and time.time() - self.play_t0 > self.play_len:
-            self.playing = False
-        if self.state in ("idle", "recording") or (self.state == "output" and self.playing):
+            dirty = True
+        if self.playing:
+            if time.time() - self.play_t0 > self.play_len:
+                self.playing = False
+            dirty = True
+        if self.state == "idle" and datetime.now().minute != self.drawn_minute:
+            dirty = True  # keep the clock current without redrawing every frame
+        if dirty:
             self.draw()
         self.root.after(80, self.tick)
 
@@ -226,67 +307,127 @@ class App:
         elif name == "play":
             self.toggle_play()
         elif name.startswith("inst_"):
-            self.instrument = name.split("_",1)[1]
+            self.stop_play()
+            self.instrument = name.split("_", 1)[1]
+        elif name == "backing":
+            self.stop_play()
+            self.backing = not self.backing
         elif name == "next":
             self.stop_play()
             self.generate_and_save()
         elif name == "new":
-            self.state, self.saved, self.result, self.notes, self.error = "idle", None, None, [], ""
-            self.audio = None; self.melody = None
+            self.state, self.saved, self.error, self.msg = "idle", None, "", ""
+            self.melody, self.arr, self.previews, self.levels = None, None, {}, []
 
     def start_recording(self):
-        self.error, self.levels = "", []
+        self.error, self.levels, self.chunks, self.peak = "", [], [], 0.0
+
+        def on_audio(indata, frames, t, status):
+            self.chunks.append(indata[:, 0].copy())
+            self.peak = max(self.peak, float(np.sqrt(np.mean(indata ** 2))))
+
+        try:
+            self.stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32", callback=on_audio)
+            self.stream.start()
+        except Exception as err:
+            self.stream, self.error = None, f"Mic error: {err}"
+            return
         self.t0 = time.time()
         self.state = "recording"
-        def worker():
-            self.audio, self.sr = audio_recorder.record(duration=RECORD_SECONDS, sr=22050)
-        threading.Thread(target=worker, daemon=True).start()
 
     def stop_recording(self):
-        if self.audio is None:
-            # wait briefly
-            self.root.after(200, self.stop_recording); return
+        if self.state != "recording":
+            return
+        self.stream.stop()
+        self.stream.close()
+        self.stream = None
+        audio = np.concatenate(self.chunks) if self.chunks else np.zeros(0, dtype=np.float32)
+        self.state = "analyzing"
+        threading.Thread(target=self.analyze, args=(audio,), daemon=True).start()
+
+    def analyze(self, audio):
+        try:
+            if len(audio) < SR // 2:
+                raise ValueError("Recording too short")
+            clean = audio_preprocessor.preprocess(audio, SR)
+            times, f0, prob, loud = pitch_detector.detect_pitch(clean, SR, with_loudness=True)
+            melody = melody_extractor.extract_melody(times, f0, prob, SR, loudness=loud)
+            arr = guitar.arrange(melody)
+            melody["drum_hits"] = drums.detect_hits(clean, SR, melody)
+        except Exception as err:
+            self.post(lambda err=err: self.analysis_failed(err))
+            return
+        self.post(lambda: self.show_result(audio, melody, arr))
+
+    def analysis_failed(self, err):
+        self.state, self.error = "idle", f"Error: {err}"
+
+    def show_result(self, audio, melody, arr):
+        self.melody, self.arr, self.previews = melody, arr, {}
+        self.duration = len(audio) / SR
+        heard = len(melody["notes"]) or len(melody["drum_hits"])
+        self.msg = f"Heard {self.duration:.1f}s" if heard else "Heard nothing"
         self.state = "output"
-        clean = audio_preprocessor.preprocess(self.audio, self.sr)
-        times, f0, prob = pitch_detector.detect_pitch(clean, self.sr)
-        melody = melody_extractor.extract_melody(times, f0, prob, self.sr)
-        self.notes = [Note(n["start"], n["start"]+n["duration"], 440.0*2**((n["midi_note"]-69)/12.0)) for n in melody["notes"]]
-        self.duration = self.audio.shape[0]/self.sr
-        self.msg = f"Pitch detected  {self.duration:.1f}s" if self.notes else "No steady notes heard"
-        self.melody = melody
 
     def toggle_play(self):
         if self.playing:
             return self.stop_play()
-        self.playing, self.play_t0, self.play_len = True, time.time(), self.duration
+        if self.rendering or not self.view_notes():
+            return
+        key = (self.instrument, self.backing)
+        if key in self.previews:
+            return self.start_play(self.previews[key])
+        self.rendering = True
+        threading.Thread(target=self.render_preview, args=(key,), daemon=True).start()
+
+    def render_preview(self, key):
+        try:
+            pm, _ = midi_generator.build_midi(self.melody, key[0], key[1])
+            audio = instrument_renderer.render(pm, SR)
+        except Exception as err:
+            def failed(err=err):
+                self.rendering, self.error = False, f"Error: {err}"
+            self.post(failed)
+            return
+
+        def done():
+            self.rendering = False
+            self.previews[key] = audio
+            # only start if the user hasn't switched instrument while we were rendering
+            if key == (self.instrument, self.backing) and self.state == "output":
+                self.start_play(audio)
+        self.post(done)
+
+    def start_play(self, audio):
+        sd.play(audio, SR)
+        self.playing, self.play_t0, self.play_len = True, time.time(), len(audio) / SR
 
     def stop_play(self):
+        if self.playing:
+            sd.stop()
         self.playing = False
 
     def generate_and_save(self):
-        self.state = "save"
-        self.saved = None
+        self.state, self.saved, self.error = "save", None, ""
+        melody, key, cached = self.melody, (self.instrument, self.backing), self.previews.get((self.instrument, self.backing))
+
         def worker():
-            import pretty_midi
-            gm = {"Piano":0,"Guitar":25,"Flute":73}[self.instrument]
-            notes = self.melody["notes"] if self.melody else []
-            pm = pretty_midi.PrettyMIDI()
-            inst = pretty_midi.Instrument(program=gm, name=self.instrument)
-            for n in notes:
-                inst.notes.append(pretty_midi.Note(velocity=90, pitch=n["midi_note"], start=n["start"], end=n["start"]+n["duration"]))
-            pm.instruments.append(inst)
-            midi_path = SAVE_DIR / f"melody-{datetime.now():%H%M%S}.mid"
-            pm.write(str(midi_path))
-            out = SAVE_DIR / f"{self.instrument.lower()}_output.wav"
-            instrument_renderer.render_midi(str(midi_path), str(out))
-            audio_player.play(str(out))
-            self.saved = out
-            self.draw()
+            try:
+                SAVE_DIR.mkdir(parents=True, exist_ok=True)
+                stem = SAVE_DIR / f"hum-{key[0].lower()}-{datetime.now():%Y%m%d-%H%M%S}"
+                pm, arr = midi_generator.build_midi(melody, *key)
+                pm.write(str(stem) + ".mid")
+                audio = cached if cached is not None else instrument_renderer.render(pm, SR)
+                sf.write(str(stem) + ".wav", audio, SR)
+                exts = ".mid .wav"
+                if arr is not None:
+                    Path(str(stem) + ".txt").write_text(guitar.tab_text(arr), encoding="utf-8")
+                    exts += " .txt"
+            except Exception as err:
+                self.post(lambda err=err: setattr(self, "error", str(err)))
+                return
+            self.post(lambda: setattr(self, "saved", f"{stem.name}  {exts}"))
         threading.Thread(target=worker, daemon=True).start()
 
 if __name__ == "__main__":
-    # helper import
-    import librosa
-    def librosa_hz(midi):
-        return librosa.midi_to_hz(midi)
     App().run()
